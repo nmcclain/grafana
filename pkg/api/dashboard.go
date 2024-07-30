@@ -5,12 +5,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
+	"github.com/google/go-github/v63/github"
 	"github.com/grafana/grafana/pkg/api/apierrors"
 	"github.com/grafana/grafana/pkg/api/dtos"
 	"github.com/grafana/grafana/pkg/api/response"
@@ -1147,6 +1151,145 @@ func (hs *HTTPServer) GetDashboardUIDs(c *contextmodel.ReqContext) {
 		uids = append(uids, qResult.UID)
 	}
 	c.JSON(http.StatusOK, uids)
+}
+
+type CreateDashboardPRRequest struct {
+	DashboardJSON    string `json:"dashboardJSON" xorm:"dashboard_json"`
+	SourceRepo       string `json:"sourceRepo" xorm:"source_repo"`
+	SourceBranch     string `json:"sourceBranch" xorm:"source_branch"`
+	DestBranchPrefix string `json:"destBranchPrefix" xorm:"dest_branch_prefix"`
+	DashFilepath     string `json:"dashFilepath" xorm:"dash_filepath"`
+	CommitMessage    string `json:"commitMessage" xorm:"commit_message"`
+}
+
+func parseGitHubURL(gitHubURL string) (string, string, error) {
+	parsedURL, err := url.Parse(gitHubURL)
+	if err != nil {
+		return "", "", err
+	}
+
+	// Split the path and remove empty strings
+	parts := strings.FieldsFunc(parsedURL.Path, func(c rune) bool {
+		return c == '/'
+	})
+
+	if len(parts) < 2 {
+		return "", "", fmt.Errorf("invalid GitHub URL")
+	}
+
+	githubUser := parts[0]
+	githubRepo := parts[1]
+
+	return githubUser, githubRepo, nil
+}
+
+func (hs *HTTPServer) CreateDashboardPR(c *contextmodel.ReqContext) response.Response {
+	var err error
+	dashUID := web.Params(c.Req)[":uid"]
+	if dashUID == "" {
+		return response.Error(http.StatusBadRequest, "dashboard UID is missing", err)
+	}
+	cmd := CreateDashboardPRRequest{}
+	if err := web.Bind(c.Req, &cmd); err != nil {
+		return response.Error(http.StatusBadRequest, "bad request data", err)
+	}
+	d := dashboards.Dashboard{}
+	if err := json.Unmarshal([]byte(cmd.DashboardJSON), &d); err != nil {
+		return response.Error(http.StatusBadRequest, "bad dashboard data", err)
+	}
+
+	// create the new branch w/GH API.
+	owner, repo, err := parseGitHubURL(cmd.SourceRepo)
+	if err != nil {
+		return response.Error(http.StatusBadRequest, "bad github url", err)
+	}
+	gh := github.NewClient(nil).WithAuthToken(os.Getenv("GITHUB_TOKEN")) // TODO: move this to standard grafana config
+	ref, _, err := gh.Git.GetRef(context.TODO(), owner, repo, "refs/heads/"+cmd.SourceBranch)
+	if err != nil {
+		return response.Error(http.StatusBadRequest, "Error getting source branch", err)
+	}
+
+	// generate a new (hopefully unique) branch name and push to GH
+	newBranchName := cmd.DestBranchPrefix + dashUID + "-" + strconv.Itoa(int(time.Now().Unix()))
+	newRef := &github.Reference{
+		Ref:    github.String("refs/heads/" + newBranchName),
+		Object: &github.GitObject{SHA: ref.Object.SHA},
+	}
+	_, _, err = gh.Git.CreateRef(context.TODO(), owner, repo, newRef)
+	if err != nil {
+		return response.Error(http.StatusBadRequest, "Error creating new ref: %v", err)
+	}
+	hs.log.Info("Dashboard GitOps created new branch", "sourceRepo", cmd.SourceRepo, "branch", newBranchName)
+
+	fileContent, _, _, err := gh.Repositories.GetContents(context.TODO(), owner, repo, cmd.DashFilepath, &github.RepositoryContentGetOptions{Ref: "refs/heads/main"})
+	if err != nil {
+		return response.Error(http.StatusBadRequest, "Error fetching file content", err)
+	}
+	sha := fileContent.GetSHA()
+
+	namespaceID, userIDstr := c.SignedInUser.GetTypedID()
+	if namespaceID != identity.TypeUser {
+		return response.Error(http.StatusBadRequest, "Error looking up user", err)
+	}
+
+	userID, err := identity.IntIdentifier(namespaceID, userIDstr)
+	if err != nil {
+		return response.Error(http.StatusBadRequest, "Error looking up user ID", err)
+	}
+
+	query := user.GetUserByIDQuery{ID: userID}
+	user, err := hs.userService.GetByID(context.TODO(), &query)
+	if err != nil {
+		return response.Error(http.StatusBadRequest, "Error looking up user object", err)
+	}
+
+	commitMessage := "Grafana dashboard updated via UI by user " + user.Login
+	if len(cmd.CommitMessage) > 0 {
+		commitMessage += ": " + cmd.CommitMessage
+	}
+
+	options := &github.RepositoryContentFileOptions{
+		Message: github.String(commitMessage),
+		Content: []byte(cmd.DashboardJSON),
+		Branch:  github.String(newBranchName),
+		SHA:     github.String(sha),
+	}
+	_, _, err = gh.Repositories.CreateFile(context.TODO(), owner, repo, cmd.DashFilepath, options)
+	if err != nil {
+		return response.Error(http.StatusInternalServerError, "Error updating dashboard file", err)
+	}
+	newPR := &github.NewPullRequest{
+		Title:               github.String("PR for " + commitMessage),
+		Head:                github.String(newBranchName),
+		Base:                github.String(cmd.SourceBranch),
+		Body:                github.String("This GtiOps PR updates the dashboard and is ready for auto-merging."),
+		MaintainerCanModify: github.Bool(true),
+	}
+	pr, _, err := gh.PullRequests.Create(context.TODO(), owner, repo, newPR)
+	if err != nil {
+		return response.Error(http.StatusInternalServerError, "Error creating pull request", err)
+	}
+	hs.log.Info("Dashboard GitOps created new Pull Request", "prURL", pr.GetHTMLURL())
+
+	mergeOpts := &github.PullRequestOptions{
+		CommitTitle: "Auto-merging PR",
+		MergeMethod: "merge",
+	}
+
+	_, _, err = gh.PullRequests.Merge(context.TODO(), owner, repo, pr.GetNumber(), "Merging PR", mergeOpts)
+	if err != nil {
+		log.Fatalf("Error merging pull request: %v", err)
+	}
+
+	return response.JSON(http.StatusAccepted, util.DynMap{
+		"status":  "success",
+		"message": "Your pull request has been successfully merged!",
+		"details": util.DynMap{
+			"title": d.Title,
+			"pr":    pr.GetNumber(),
+			"prUrl": pr.GetHTMLURL(),
+		},
+	})
 }
 
 // swagger:parameters restoreDashboardVersionByID

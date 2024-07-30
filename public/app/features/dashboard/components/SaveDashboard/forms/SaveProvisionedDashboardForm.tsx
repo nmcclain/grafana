@@ -6,12 +6,15 @@ import { Button, ClipboardButton, HorizontalGroup, TextArea, Stack } from '@graf
 
 import { SaveDashboardFormProps } from '../types';
 
-export const SaveProvisionedDashboardForm = ({ dashboard, onCancel }: Omit<SaveDashboardFormProps, 'isLoading'>) => {
+import { SaveToGitHubDashboardForm } from './SaveToGitHubDashboardForm'; 
+
+export const SaveProvisionedDashboardForm = ({ dashboard, onCancel, onSuccess }: Omit<SaveDashboardFormProps, 'isLoading'>) => {
   const [dashboardJSON, setDashboardJson] = useState(() => {
     const clone = dashboard.getSaveModelClone();
     delete clone.id;
     return JSON.stringify(clone, null, 2);
   });
+  const [showGitHubModal, setShowGitHubModal] = useState(false);
 
   const saveToFile = useCallback(() => {
     const blob = new Blob([dashboardJSON], {
@@ -19,6 +22,10 @@ export const SaveProvisionedDashboardForm = ({ dashboard, onCancel }: Omit<SaveD
     });
     saveAs(blob, dashboard.title + '-' + new Date().getTime() + '.json');
   }, [dashboard.title, dashboardJSON]);
+
+  const showModal = () => {
+    setShowGitHubModal(true)
+  }
 
   return (
     <>
@@ -60,8 +67,18 @@ export const SaveProvisionedDashboardForm = ({ dashboard, onCancel }: Omit<SaveD
           <Button type="submit" onClick={saveToFile}>
             Save JSON to file
           </Button>
+          <Button type="submit" onClick={showModal}>
+            Open GitHub Pull Request
+          </Button>
         </HorizontalGroup>
       </Stack>
+      {showGitHubModal && (
+        <SaveToGitHubDashboardForm 
+          dashboard={dashboard} 
+          onCancel={() => setShowGitHubModal(false)} 
+          onSuccess={onSuccess}
+        />
+      )}
     </>
   );
 };
